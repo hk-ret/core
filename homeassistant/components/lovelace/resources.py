@@ -5,14 +5,13 @@ import uuid
 
 import voluptuous as vol
 
-from homeassistant.const import CONF_TYPE
+from homeassistant.const import CONF_RESOURCES, CONF_TYPE
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import collection, storage
 
 from .const import (
     CONF_RESOURCE_TYPE_WS,
-    CONF_RESOURCES,
     DOMAIN,
     RESOURCE_CREATE_FIELDS,
     RESOURCE_SCHEMA,
@@ -34,6 +33,10 @@ class ResourceYAMLCollection:
         """Initialize a resource YAML collection."""
         self.data = data
 
+    async def async_get_info(self):
+        """Return the resources info for YAML mode."""
+        return {"resources": len(self.async_items() or [])}
+
     @callback
     def async_items(self) -> List[dict]:
         """Return list of items in collection."""
@@ -54,6 +57,14 @@ class ResourceStorageCollection(collection.StorageCollection):
             _LOGGER,
         )
         self.ll_config = ll_config
+
+    async def async_get_info(self):
+        """Return the resources info for YAML mode."""
+        if not self.loaded:
+            await self.async_load()
+            self.loaded = True
+
+        return {"resources": len(self.async_items() or [])}
 
     async def _async_load_data(self) -> Optional[dict]:
         """Load the data."""

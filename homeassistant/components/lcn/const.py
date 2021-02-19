@@ -1,7 +1,14 @@
 """Constants for the LCN component."""
 from itertools import product
 
-from homeassistant.const import TEMP_CELSIUS, TEMP_FAHRENHEIT, UNIT_PERCENTAGE
+from homeassistant.const import (
+    DEGREE,
+    PERCENTAGE,
+    TEMP_CELSIUS,
+    TEMP_FAHRENHEIT,
+    TEMP_KELVIN,
+    VOLT,
+)
 
 DOMAIN = "lcn"
 DATA_LCN = "lcn"
@@ -18,7 +25,6 @@ CONF_LOCKABLE = "lockable"
 CONF_VARIABLE = "variable"
 CONF_VALUE = "value"
 CONF_RELVARREF = "value_reference"
-CONF_SOURCE = "source"
 CONF_SETPOINT = "setpoint"
 CONF_LED = "led"
 CONF_KEYS = "keys"
@@ -33,7 +39,6 @@ CONF_MAX_TEMP = "max_temp"
 CONF_MIN_TEMP = "min_temp"
 CONF_SCENES = "scenes"
 CONF_REGISTER = "register"
-CONF_SCENE = "scene"
 CONF_OUTPUTS = "outputs"
 CONF_REVERSE_TIME = "reverse_time"
 
@@ -144,7 +149,7 @@ VAR_UNITS = [
     "LCN",
     "NATIVE",
     TEMP_CELSIUS,
-    "°K",
+    TEMP_KELVIN,
     TEMP_FAHRENHEIT,
     "LUX_T",
     "LX_T",
@@ -153,16 +158,16 @@ VAR_UNITS = [
     "LX",
     "M/S",
     "METERPERSECOND",
-    UNIT_PERCENTAGE,
+    PERCENTAGE,
     "PERCENT",
     "PPM",
     "VOLT",
-    "V",
+    VOLT,
     "AMPERE",
     "AMP",
     "A",
     "DEGREE",
-    "°",
+    DEGREE,
 ]
 
 RELVARREF = ["CURRENT", "PROG"]

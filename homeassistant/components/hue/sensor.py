@@ -1,17 +1,26 @@
 """Hue sensor entities."""
-from aiohue.sensors import TYPE_ZLL_LIGHTLEVEL, TYPE_ZLL_TEMPERATURE
+from aiohue.sensors import (
+    TYPE_ZLL_LIGHTLEVEL,
+    TYPE_ZLL_ROTARY,
+    TYPE_ZLL_SWITCH,
+    TYPE_ZLL_TEMPERATURE,
+)
 
 from homeassistant.const import (
+    DEVICE_CLASS_BATTERY,
     DEVICE_CLASS_ILLUMINANCE,
     DEVICE_CLASS_TEMPERATURE,
+    LIGHT_LUX,
+    PERCENTAGE,
     TEMP_CELSIUS,
 )
 from homeassistant.helpers.entity import Entity
 
 from .const import DOMAIN as HUE_DOMAIN
-from .sensor_base import SENSOR_CONFIG_MAP, GenericZLLSensor
+from .sensor_base import SENSOR_CONFIG_MAP, GenericHueSensor, GenericZLLSensor
 
 LIGHT_LEVEL_NAME_FORMAT = "{} light level"
+REMOTE_NAME_FORMAT = "{} battery level"
 TEMPERATURE_NAME_FORMAT = "{} temperature"
 
 
@@ -33,7 +42,7 @@ class HueLightLevel(GenericHueGaugeSensorEntity):
     """The light level sensor entity for a Hue motion sensor device."""
 
     device_class = DEVICE_CLASS_ILLUMINANCE
-    unit_of_measurement = "lx"
+    unit_of_measurement = LIGHT_LUX
 
     @property
     def state(self):
@@ -79,6 +88,30 @@ class HueTemperature(GenericHueGaugeSensorEntity):
         return self.sensor.temperature / 100
 
 
+class HueBattery(GenericHueSensor):
+    """Battery class for when a batt-powered device is only represented as an event."""
+
+    @property
+    def unique_id(self):
+        """Return a unique identifier for this device."""
+        return f"{self.sensor.uniqueid}-battery"
+
+    @property
+    def state(self):
+        """Return the state of the battery."""
+        return self.sensor.battery
+
+    @property
+    def device_class(self):
+        """Return the class of the sensor."""
+        return DEVICE_CLASS_BATTERY
+
+    @property
+    def unit_of_measurement(self):
+        """Return the unit of measurement of this entity."""
+        return PERCENTAGE
+
+
 SENSOR_CONFIG_MAP.update(
     {
         TYPE_ZLL_LIGHTLEVEL: {
@@ -90,6 +123,16 @@ SENSOR_CONFIG_MAP.update(
             "platform": "sensor",
             "name_format": TEMPERATURE_NAME_FORMAT,
             "class": HueTemperature,
+        },
+        TYPE_ZLL_SWITCH: {
+            "platform": "sensor",
+            "name_format": REMOTE_NAME_FORMAT,
+            "class": HueBattery,
+        },
+        TYPE_ZLL_ROTARY: {
+            "platform": "sensor",
+            "name_format": REMOTE_NAME_FORMAT,
+            "class": HueBattery,
         },
     }
 )

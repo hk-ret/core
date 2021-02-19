@@ -96,12 +96,13 @@ class GeonetnzQuakesEvent(GeolocationEvent):
         self._remove_signal_update()
         # Remove from entity registry.
         entity_registry = await async_get_registry(self.hass)
-        entity_registry.async_remove(self.entity_id)
+        if self.entity_id in entity_registry.entities:
+            entity_registry.async_remove(self.entity_id)
 
     @callback
     def _delete_callback(self):
         """Remove this entity."""
-        self.hass.async_create_task(self.async_remove())
+        self.hass.async_create_task(self.async_remove(force_remove=True))
 
     @callback
     def _update_callback(self):

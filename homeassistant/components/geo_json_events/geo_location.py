@@ -14,6 +14,7 @@ from homeassistant.const import (
     CONF_SCAN_INTERVAL,
     CONF_URL,
     EVENT_HOMEASSISTANT_START,
+    LENGTH_KILOMETERS,
 )
 from homeassistant.core import callback
 import homeassistant.helpers.config_validation as cv
@@ -25,7 +26,6 @@ _LOGGER = logging.getLogger(__name__)
 ATTR_EXTERNAL_ID = "external_id"
 
 DEFAULT_RADIUS_IN_KM = 20.0
-DEFAULT_UNIT_OF_MEASUREMENT = "km"
 
 SCAN_INTERVAL = timedelta(minutes=5)
 
@@ -144,7 +144,7 @@ class GeoJsonLocationEvent(GeolocationEvent):
         """Remove this entity."""
         self._remove_signal_delete()
         self._remove_signal_update()
-        self.hass.async_create_task(self.async_remove())
+        self.hass.async_create_task(self.async_remove(force_remove=True))
 
     @callback
     def _update_callback(self):
@@ -198,12 +198,11 @@ class GeoJsonLocationEvent(GeolocationEvent):
     @property
     def unit_of_measurement(self):
         """Return the unit of measurement."""
-        return DEFAULT_UNIT_OF_MEASUREMENT
+        return LENGTH_KILOMETERS
 
     @property
     def device_state_attributes(self):
         """Return the device state attributes."""
-        attributes = {}
-        if self._external_id:
-            attributes[ATTR_EXTERNAL_ID] = self._external_id
-        return attributes
+        if not self._external_id:
+            return {}
+        return {ATTR_EXTERNAL_ID: self._external_id}

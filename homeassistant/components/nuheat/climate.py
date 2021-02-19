@@ -1,11 +1,19 @@
 """Support for NuHeat thermostats."""
-from datetime import timedelta
+from datetime import datetime
 import logging
+import time
 
 from nuheat.config import SCHEDULE_HOLD, SCHEDULE_RUN, SCHEDULE_TEMPORARY_HOLD
+from nuheat.util import (
+    celsius_to_nuheat,
+    fahrenheit_to_nuheat,
+    nuheat_to_celsius,
+    nuheat_to_fahrenheit,
+)
 
-from homeassistant.components.climate import ClimateDevice
+from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import (
+    ATTR_HVAC_MODE,
     CURRENT_HVAC_HEAT,
     CURRENT_HVAC_IDLE,
     HVAC_MODE_AUTO,
@@ -14,13 +22,23 @@ from homeassistant.components.climate.const import (
     SUPPORT_TARGET_TEMPERATURE,
 )
 from homeassistant.const import ATTR_TEMPERATURE, TEMP_CELSIUS, TEMP_FAHRENHEIT
-from homeassistant.util import Throttle
+from homeassistant.core import callback
+from homeassistant.helpers import event as event_helper
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, MANUFACTURER
+from .const import (
+    DOMAIN,
+    MANUFACTURER,
+    NUHEAT_API_STATE_SHIFT_DELAY,
+    NUHEAT_DATETIME_FORMAT,
+    NUHEAT_KEY_HOLD_SET_POINT_DATE_TIME,
+    NUHEAT_KEY_SCHEDULE_MODE,
+    NUHEAT_KEY_SET_POINT_TEMP,
+    TEMP_HOLD_TIME_SEC,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-MIN_TIME_BETWEEN_UPDATES = timedelta(minutes=5)
 
 # The device does not have an off function.
 # To turn it off set to min_temp and PRESET_PERMANENT_HOLD
@@ -47,11 +65,10 @@ SUPPORT_FLAGS = SUPPORT_TARGET_TEMPERATURE | SUPPORT_PRESET_MODE
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
     """Set up the NuHeat thermostat(s)."""
-    api, serial_number = hass.data[DOMAIN][config_entry.entry_id]
+    thermostat, coordinator = hass.data[DOMAIN][config_entry.entry_id]
 
     temperature_unit = hass.config.units.temperature_unit
-    thermostat = await hass.async_add_executor_job(api.get_thermostat, serial_number)
-    entity = NuHeatThermostat(thermostat, temperature_unit)
+    entity = NuHeatThermostat(coordinator, thermostat, temperature_unit)
 
     # No longer need a service as set_hvac_mode to auto does this
     # since climate 1.0 has been implemented
@@ -59,14 +76,16 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     async_add_entities([entity], True)
 
 
-class NuHeatThermostat(ClimateDevice):
+class NuHeatThermostat(CoordinatorEntity, ClimateEntity):
     """Representation of a NuHeat Thermostat."""
 
-    def __init__(self, thermostat, temperature_unit):
+    def __init__(self, coordinator, thermostat, temperature_unit):
         """Initialize the thermostat."""
+        super().__init__(coordinator)
         self._thermostat = thermostat
         self._temperature_unit = temperature_unit
-        self._force_update = False
+        self._schedule_mode = None
+        self._target_temperature = None
 
     @property
     def name(self):
@@ -102,23 +121,19 @@ class NuHeatThermostat(ClimateDevice):
     @property
     def available(self):
         """Return the unique id."""
-        return self._thermostat.online
+        return self.coordinator.last_update_success and self._thermostat.online
 
     def set_hvac_mode(self, hvac_mode):
         """Set the system mode."""
-
-        # This is the same as what res
         if hvac_mode == HVAC_MODE_AUTO:
-            self._thermostat.resume_schedule()
+            self._set_schedule_mode(SCHEDULE_RUN)
         elif hvac_mode == HVAC_MODE_HEAT:
-            self._thermostat.schedule_mode = SCHEDULE_HOLD
-
-        self._schedule_update()
+            self._set_schedule_mode(SCHEDULE_HOLD)
 
     @property
     def hvac_mode(self):
         """Return current setting heat or auto."""
-        if self._thermostat.schedule_mode in (SCHEDULE_TEMPORARY_HOLD, SCHEDULE_HOLD):
+        if self._schedule_mode in (SCHEDULE_TEMPORARY_HOLD, SCHEDULE_HOLD):
             return HVAC_MODE_HEAT
         return HVAC_MODE_AUTO
 
@@ -147,15 +162,14 @@ class NuHeatThermostat(ClimateDevice):
     def target_temperature(self):
         """Return the currently programmed temperature."""
         if self._temperature_unit == "C":
-            return self._thermostat.target_celsius
+            return nuheat_to_celsius(self._target_temperature)
 
-        return self._thermostat.target_fahrenheit
+        return nuheat_to_fahrenheit(self._target_temperature)
 
     @property
     def preset_mode(self):
         """Return current preset mode."""
-        schedule_mode = self._thermostat.schedule_mode
-        return SCHEDULE_MODE_TO_PRESET_MODE_MAP.get(schedule_mode, PRESET_RUN)
+        return SCHEDULE_MODE_TO_PRESET_MODE_MAP.get(self._schedule_mode, PRESET_RUN)
 
     @property
     def preset_modes(self):
@@ -167,58 +181,107 @@ class NuHeatThermostat(ClimateDevice):
         """Return list of possible operation modes."""
         return OPERATION_LIST
 
-    def resume_program(self):
-        """Resume the thermostat's programmed schedule."""
-        self._thermostat.resume_schedule()
-        self._schedule_update()
-
     def set_preset_mode(self, preset_mode):
         """Update the hold mode of the thermostat."""
-
-        self._thermostat.schedule_mode = PRESET_MODE_TO_SCHEDULE_MODE_MAP.get(
-            preset_mode, SCHEDULE_RUN
+        self._set_schedule_mode(
+            PRESET_MODE_TO_SCHEDULE_MODE_MAP.get(preset_mode, SCHEDULE_RUN)
         )
+
+    def _set_schedule_mode(self, schedule_mode):
+        """Set a schedule mode."""
+        self._schedule_mode = schedule_mode
+        # Changing the property here does the actual set
+        self._thermostat.schedule_mode = schedule_mode
         self._schedule_update()
 
     def set_temperature(self, **kwargs):
         """Set a new target temperature."""
-        self._set_temperature(kwargs.get(ATTR_TEMPERATURE))
+        self._set_temperature_and_mode(
+            kwargs.get(ATTR_TEMPERATURE), hvac_mode=kwargs.get(ATTR_HVAC_MODE)
+        )
 
-    def _set_temperature(self, temperature):
+    def _set_temperature_and_mode(self, temperature, hvac_mode=None, preset_mode=None):
+        """Set temperature and hvac mode at the same time."""
         if self._temperature_unit == "C":
-            self._thermostat.target_celsius = temperature
+            target_temperature = celsius_to_nuheat(temperature)
         else:
-            self._thermostat.target_fahrenheit = temperature
+            target_temperature = fahrenheit_to_nuheat(temperature)
+
         # If they set a temperature without changing the mode
         # to heat, we behave like the device does locally
         # and set a temp hold.
-        if self._thermostat.schedule_mode == SCHEDULE_RUN:
-            self._thermostat.schedule_mode = SCHEDULE_TEMPORARY_HOLD
+        target_schedule_mode = SCHEDULE_TEMPORARY_HOLD
+        if preset_mode:
+            target_schedule_mode = PRESET_MODE_TO_SCHEDULE_MODE_MAP.get(
+                preset_mode, SCHEDULE_RUN
+            )
+        elif self._schedule_mode == SCHEDULE_HOLD or (
+            hvac_mode and hvac_mode == HVAC_MODE_HEAT
+        ):
+            target_schedule_mode = SCHEDULE_HOLD
 
         _LOGGER.debug(
-            "Setting NuHeat thermostat temperature to %s %s",
+            "Setting NuHeat thermostat temperature to %s %s and schedule mode: %s",
             temperature,
             self.temperature_unit,
+            target_schedule_mode,
         )
+
+        target_temperature = max(
+            min(self._thermostat.max_temperature, target_temperature),
+            self._thermostat.min_temperature,
+        )
+
+        request = {
+            NUHEAT_KEY_SET_POINT_TEMP: target_temperature,
+            NUHEAT_KEY_SCHEDULE_MODE: target_schedule_mode,
+        }
+
+        if target_schedule_mode == SCHEDULE_TEMPORARY_HOLD:
+            request[NUHEAT_KEY_HOLD_SET_POINT_DATE_TIME] = datetime.fromtimestamp(
+                time.time() + TEMP_HOLD_TIME_SEC
+            ).strftime(NUHEAT_DATETIME_FORMAT)
+
+        self._thermostat.set_data(request)
+        self._schedule_mode = target_schedule_mode
+        self._target_temperature = target_temperature
         self._schedule_update()
 
     def _schedule_update(self):
-        self._force_update = True
-        if self.hass:
-            self.schedule_update_ha_state(True)
+        if not self.hass:
+            return
 
-    def update(self):
+        # Update the new state
+        self.schedule_update_ha_state(False)
+
+        # nuheat has a delay switching state
+        # so we schedule a poll of the api
+        # in the future to make sure the change actually
+        # took effect
+        event_helper.call_later(
+            self.hass, NUHEAT_API_STATE_SHIFT_DELAY, self._forced_refresh
+        )
+
+    async def _forced_refresh(self, *_) -> None:
+        """Force a refresh."""
+        await self.coordinator.async_refresh()
+
+    async def async_added_to_hass(self) -> None:
+        """When entity is added to hass."""
+        await super().async_added_to_hass()
+        self._update_internal_state()
+
+    @callback
+    def _update_internal_state(self):
+        """Update our internal state from the last api response."""
+        self._schedule_mode = self._thermostat.schedule_mode
+        self._target_temperature = self._thermostat.target_temperature
+
+    @callback
+    def _handle_coordinator_update(self):
         """Get the latest state from the thermostat."""
-        if self._force_update:
-            self._throttled_update(no_throttle=True)
-            self._force_update = False
-        else:
-            self._throttled_update()
-
-    @Throttle(MIN_TIME_BETWEEN_UPDATES)
-    def _throttled_update(self, **kwargs):
-        """Get the latest state from the thermostat with a throttle."""
-        self._thermostat.get_data()
+        self._update_internal_state()
+        self.async_write_ha_state()
 
     @property
     def device_info(self):
@@ -226,5 +289,6 @@ class NuHeatThermostat(ClimateDevice):
         return {
             "identifiers": {(DOMAIN, self._thermostat.serial_number)},
             "name": self._thermostat.room,
+            "model": "nVent Signature",
             "manufacturer": MANUFACTURER,
         }

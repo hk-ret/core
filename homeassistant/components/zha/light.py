@@ -1,19 +1,46 @@
 """Lights on Zigbee Home Automation networks."""
+from collections import Counter
 from datetime import timedelta
+import enum
 import functools
+import itertools
 import logging
 import random
+from typing import Any, Dict, List, Optional, Tuple
 
+from zigpy.zcl.clusters.general import Identify, LevelControl, OnOff
+from zigpy.zcl.clusters.lighting import Color
 from zigpy.zcl.foundation import Status
 
 from homeassistant.components import light
-from homeassistant.const import STATE_ON
-from homeassistant.core import callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.components.light import (
+    ATTR_BRIGHTNESS,
+    ATTR_COLOR_TEMP,
+    ATTR_EFFECT,
+    ATTR_EFFECT_LIST,
+    ATTR_HS_COLOR,
+    ATTR_MAX_MIREDS,
+    ATTR_MIN_MIREDS,
+    ATTR_WHITE_VALUE,
+    SUPPORT_BRIGHTNESS,
+    SUPPORT_COLOR,
+    SUPPORT_COLOR_TEMP,
+    SUPPORT_EFFECT,
+    SUPPORT_FLASH,
+    SUPPORT_TRANSITION,
+    SUPPORT_WHITE_VALUE,
+)
+from homeassistant.const import ATTR_SUPPORTED_FEATURES, STATE_ON, STATE_UNAVAILABLE
+from homeassistant.core import State, callback
+from homeassistant.helpers.debounce import Debouncer
+from homeassistant.helpers.dispatcher import (
+    async_dispatcher_connect,
+    async_dispatcher_send,
+)
 from homeassistant.helpers.event import async_track_time_interval
 import homeassistant.util.color as color_util
 
-from .core import discovery
+from .core import discovery, helpers
 from .core.const import (
     CHANNEL_COLOR,
     CHANNEL_LEVEL,
@@ -27,9 +54,10 @@ from .core.const import (
     SIGNAL_ATTR_UPDATED,
     SIGNAL_SET_LEVEL,
 )
+from .core.helpers import LogMixin
 from .core.registries import ZHA_ENTITIES
 from .core.typing import ZhaDeviceType
-from .entity import ZhaEntity
+from .entity import ZhaEntity, ZhaGroupEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,7 +74,27 @@ FLASH_EFFECTS = {light.FLASH_SHORT: EFFECT_BLINK, light.FLASH_LONG: EFFECT_BREAT
 
 UNSUPPORTED_ATTRIBUTE = 0x86
 STRICT_MATCH = functools.partial(ZHA_ENTITIES.strict_match, light.DOMAIN)
+GROUP_MATCH = functools.partial(ZHA_ENTITIES.group_match, light.DOMAIN)
 PARALLEL_UPDATES = 0
+SIGNAL_LIGHT_GROUP_STATE_CHANGED = "zha_light_group_state_changed"
+
+SUPPORT_GROUP_LIGHT = (
+    SUPPORT_BRIGHTNESS
+    | SUPPORT_COLOR_TEMP
+    | SUPPORT_EFFECT
+    | SUPPORT_FLASH
+    | SUPPORT_COLOR
+    | SUPPORT_TRANSITION
+    | SUPPORT_WHITE_VALUE
+)
+
+
+class LightColorMode(enum.IntEnum):
+    """ZCL light color mode enum."""
+
+    HS_COLOR = 0x00
+    XY_COLOR = 0x01
+    COLOR_TEMP = 0x02
 
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
@@ -63,48 +111,34 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     hass.data[DATA_ZHA][DATA_ZHA_DISPATCHERS].append(unsub)
 
 
-@STRICT_MATCH(channel_names=CHANNEL_ON_OFF, aux_channels={CHANNEL_COLOR, CHANNEL_LEVEL})
-class Light(ZhaEntity, light.Light):
-    """Representation of a ZHA or ZLL light."""
+class BaseLight(LogMixin, light.LightEntity):
+    """Operations common to all light entities."""
 
-    _REFRESH_INTERVAL = (45, 75)
+    def __init__(self, *args, **kwargs):
+        """Initialize the light."""
+        super().__init__(*args, **kwargs)
+        self._available: bool = False
+        self._brightness: Optional[int] = None
+        self._off_brightness: Optional[int] = None
+        self._hs_color: Optional[Tuple[float, float]] = None
+        self._color_temp: Optional[int] = None
+        self._min_mireds: Optional[int] = 153
+        self._max_mireds: Optional[int] = 500
+        self._white_value: Optional[int] = None
+        self._effect_list: Optional[List[str]] = None
+        self._effect: Optional[str] = None
+        self._supported_features: int = 0
+        self._state: bool = False
+        self._on_off_channel = None
+        self._level_channel = None
+        self._color_channel = None
+        self._identify_channel = None
 
-    def __init__(self, unique_id, zha_device: ZhaDeviceType, channels, **kwargs):
-        """Initialize the ZHA light."""
-        super().__init__(unique_id, zha_device, channels, **kwargs)
-        self._supported_features = 0
-        self._color_temp = None
-        self._hs_color = None
-        self._brightness = None
-        self._off_brightness = None
-        self._effect_list = []
-        self._effect = None
-        self._on_off_channel = self.cluster_channels.get(CHANNEL_ON_OFF)
-        self._level_channel = self.cluster_channels.get(CHANNEL_LEVEL)
-        self._color_channel = self.cluster_channels.get(CHANNEL_COLOR)
-        self._identify_channel = self.zha_device.channels.identify_ch
-        self._cancel_refresh_handle = None
-
-        if self._level_channel:
-            self._supported_features |= light.SUPPORT_BRIGHTNESS
-            self._supported_features |= light.SUPPORT_TRANSITION
-            self._brightness = 0
-
-        if self._color_channel:
-            color_capabilities = self._color_channel.get_color_capabilities()
-            if color_capabilities & CAPABILITIES_COLOR_TEMP:
-                self._supported_features |= light.SUPPORT_COLOR_TEMP
-
-            if color_capabilities & CAPABILITIES_COLOR_XY:
-                self._supported_features |= light.SUPPORT_COLOR
-                self._hs_color = (0, 0)
-
-            if color_capabilities & CAPABILITIES_COLOR_LOOP:
-                self._supported_features |= light.SUPPORT_EFFECT
-                self._effect_list.append(light.EFFECT_COLORLOOP)
-
-        if self._identify_channel:
-            self._supported_features |= light.SUPPORT_FLASH
+    @property
+    def device_state_attributes(self) -> Dict[str, Any]:
+        """Return state attributes."""
+        attributes = {"off_brightness": self._off_brightness}
+        return attributes
 
     @property
     def is_on(self) -> bool:
@@ -119,10 +153,14 @@ class Light(ZhaEntity, light.Light):
         return self._brightness
 
     @property
-    def device_state_attributes(self):
-        """Return state attributes."""
-        attributes = {"off_brightness": self._off_brightness}
-        return attributes
+    def min_mireds(self):
+        """Return the coldest color_temp that this light supports."""
+        return self._min_mireds
+
+    @property
+    def max_mireds(self):
+        """Return the warmest color_temp that this light supports."""
+        return self._max_mireds
 
     def set_level(self, value):
         """Set the brightness of this light between 0..254.
@@ -160,53 +198,10 @@ class Light(ZhaEntity, light.Light):
         """Flag supported features."""
         return self._supported_features
 
-    @callback
-    def async_set_state(self, attr_id, attr_name, value):
-        """Set the state."""
-        self._state = bool(value)
-        if value:
-            self._off_brightness = None
-        self.async_write_ha_state()
-
-    async def async_added_to_hass(self):
-        """Run when about to be added to hass."""
-        await super().async_added_to_hass()
-        await self.async_accept_signal(
-            self._on_off_channel, SIGNAL_ATTR_UPDATED, self.async_set_state
-        )
-        if self._level_channel:
-            await self.async_accept_signal(
-                self._level_channel, SIGNAL_SET_LEVEL, self.set_level
-            )
-        refresh_interval = random.randint(*[x * 60 for x in self._REFRESH_INTERVAL])
-        self._cancel_refresh_handle = async_track_time_interval(
-            self.hass, self._refresh, timedelta(seconds=refresh_interval)
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Disconnect entity object when removed."""
-        self._cancel_refresh_handle()
-        await super().async_will_remove_from_hass()
-
-    @callback
-    def async_restore_last_state(self, last_state):
-        """Restore previous state."""
-        self._state = last_state.state == STATE_ON
-        if "brightness" in last_state.attributes:
-            self._brightness = last_state.attributes["brightness"]
-        if "off_brightness" in last_state.attributes:
-            self._off_brightness = last_state.attributes["off_brightness"]
-        if "color_temp" in last_state.attributes:
-            self._color_temp = last_state.attributes["color_temp"]
-        if "hs_color" in last_state.attributes:
-            self._hs_color = last_state.attributes["hs_color"]
-        if "effect" in last_state.attributes:
-            self._effect = last_state.attributes["effect"]
-
     async def async_turn_on(self, **kwargs):
         """Turn the entity on."""
         transition = kwargs.get(light.ATTR_TRANSITION)
-        duration = transition * 10 if transition else 0
+        duration = transition * 10 if transition else 1
         brightness = kwargs.get(light.ATTR_BRIGHTNESS)
         effect = kwargs.get(light.ATTR_EFFECT)
         flash = kwargs.get(light.ATTR_FLASH)
@@ -253,6 +248,7 @@ class Light(ZhaEntity, light.Light):
                 self.debug("turned on: %s", t_log)
                 return
             self._color_temp = temperature
+            self._hs_color = None
 
         if (
             light.ATTR_HS_COLOR in kwargs
@@ -268,6 +264,7 @@ class Light(ZhaEntity, light.Light):
                 self.debug("turned on: %s", t_log)
                 return
             self._hs_color = hs_color
+            self._color_temp = None
 
         if (
             effect == light.EFFECT_COLORLOOP
@@ -294,7 +291,7 @@ class Light(ZhaEntity, light.Light):
                 0x0,
                 0x0,
                 0x0,
-                0x0,  # update action only, action off, no dir,time,hue
+                0x0,  # update action only, action off, no dir, time, hue
             )
             t_log["color_loop_set"] = result
             self._effect = None
@@ -331,74 +328,177 @@ class Light(ZhaEntity, light.Light):
 
         self.async_write_ha_state()
 
-    async def async_update(self):
-        """Attempt to retrieve on off state from the light."""
-        await super().async_update()
-        await self.async_get_state()
 
-    async def async_get_state(self, from_cache=True):
-        """Attempt to retrieve on off state from the light."""
+@STRICT_MATCH(channel_names=CHANNEL_ON_OFF, aux_channels={CHANNEL_COLOR, CHANNEL_LEVEL})
+class Light(BaseLight, ZhaEntity):
+    """Representation of a ZHA or ZLL light."""
+
+    _REFRESH_INTERVAL = (45, 75)
+
+    def __init__(self, unique_id, zha_device: ZhaDeviceType, channels, **kwargs):
+        """Initialize the ZHA light."""
+        super().__init__(unique_id, zha_device, channels, **kwargs)
+        self._on_off_channel = self.cluster_channels.get(CHANNEL_ON_OFF)
+        self._state = bool(self._on_off_channel.on_off)
+        self._level_channel = self.cluster_channels.get(CHANNEL_LEVEL)
+        self._color_channel = self.cluster_channels.get(CHANNEL_COLOR)
+        self._identify_channel = self.zha_device.channels.identify_ch
+        if self._color_channel:
+            self._min_mireds: Optional[int] = self._color_channel.min_mireds
+            self._max_mireds: Optional[int] = self._color_channel.max_mireds
+        self._cancel_refresh_handle = None
+        effect_list = []
+
+        if self._level_channel:
+            self._supported_features |= light.SUPPORT_BRIGHTNESS
+            self._supported_features |= light.SUPPORT_TRANSITION
+            self._brightness = self._level_channel.current_level
+
+        if self._color_channel:
+            color_capabilities = self._color_channel.color_capabilities
+            if color_capabilities & CAPABILITIES_COLOR_TEMP:
+                self._supported_features |= light.SUPPORT_COLOR_TEMP
+                self._color_temp = self._color_channel.color_temperature
+
+            if color_capabilities & CAPABILITIES_COLOR_XY:
+                self._supported_features |= light.SUPPORT_COLOR
+                curr_x = self._color_channel.current_x
+                curr_y = self._color_channel.current_y
+                if curr_x is not None and curr_y is not None:
+                    self._hs_color = color_util.color_xy_to_hs(
+                        float(curr_x / 65535), float(curr_y / 65535)
+                    )
+                else:
+                    self._hs_color = (0, 0)
+
+            if color_capabilities & CAPABILITIES_COLOR_LOOP:
+                self._supported_features |= light.SUPPORT_EFFECT
+                effect_list.append(light.EFFECT_COLORLOOP)
+                if self._color_channel.color_loop_active == 1:
+                    self._effect = light.EFFECT_COLORLOOP
+
+        if self._identify_channel:
+            self._supported_features |= light.SUPPORT_FLASH
+
+        if effect_list:
+            self._effect_list = effect_list
+
+    @callback
+    def async_set_state(self, attr_id, attr_name, value):
+        """Set the state."""
+        self._state = bool(value)
+        if value:
+            self._off_brightness = None
+        self.async_write_ha_state()
+
+    async def async_added_to_hass(self):
+        """Run when about to be added to hass."""
+        await super().async_added_to_hass()
+        self.async_accept_signal(
+            self._on_off_channel, SIGNAL_ATTR_UPDATED, self.async_set_state
+        )
+        if self._level_channel:
+            self.async_accept_signal(
+                self._level_channel, SIGNAL_SET_LEVEL, self.set_level
+            )
+        refresh_interval = random.randint(*[x * 60 for x in self._REFRESH_INTERVAL])
+        self._cancel_refresh_handle = async_track_time_interval(
+            self.hass, self._refresh, timedelta(seconds=refresh_interval)
+        )
+        self.async_accept_signal(
+            None,
+            SIGNAL_LIGHT_GROUP_STATE_CHANGED,
+            self._maybe_force_refresh,
+            signal_override=True,
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Disconnect entity object when removed."""
+        self._cancel_refresh_handle()
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def async_restore_last_state(self, last_state):
+        """Restore previous state."""
+        self._state = last_state.state == STATE_ON
+        if "brightness" in last_state.attributes:
+            self._brightness = last_state.attributes["brightness"]
+        if "off_brightness" in last_state.attributes:
+            self._off_brightness = last_state.attributes["off_brightness"]
+        if "color_temp" in last_state.attributes:
+            self._color_temp = last_state.attributes["color_temp"]
+        if "hs_color" in last_state.attributes:
+            self._hs_color = last_state.attributes["hs_color"]
+        if "effect" in last_state.attributes:
+            self._effect = last_state.attributes["effect"]
+
+    async def async_get_state(self):
+        """Attempt to retrieve the state from the light."""
+        if not self.available:
+            return
         self.debug("polling current state")
         if self._on_off_channel:
             state = await self._on_off_channel.get_attribute_value(
-                "on_off", from_cache=from_cache
+                "on_off", from_cache=False
             )
             if state is not None:
                 self._state = state
         if self._level_channel:
             level = await self._level_channel.get_attribute_value(
-                "current_level", from_cache=from_cache
+                "current_level", from_cache=False
             )
             if level is not None:
                 self._brightness = level
         if self._color_channel:
-            attributes = []
-            color_capabilities = self._color_channel.get_color_capabilities()
-            if (
-                color_capabilities is not None
-                and color_capabilities & CAPABILITIES_COLOR_TEMP
-            ):
-                attributes.append("color_temperature")
-            if (
-                color_capabilities is not None
-                and color_capabilities & CAPABILITIES_COLOR_XY
-            ):
-                attributes.append("current_x")
-                attributes.append("current_y")
-            if (
-                color_capabilities is not None
-                and color_capabilities & CAPABILITIES_COLOR_LOOP
-            ):
-                attributes.append("color_loop_active")
+            attributes = [
+                "color_mode",
+                "color_temperature",
+                "current_x",
+                "current_y",
+                "color_loop_active",
+            ]
 
             results = await self._color_channel.get_attributes(
-                attributes, from_cache=from_cache
+                attributes, from_cache=False
             )
 
-            if (
-                "color_temperature" in results
-                and results["color_temperature"] is not None
-            ):
-                self._color_temp = results["color_temperature"]
+            color_mode = results.get("color_mode")
+            if color_mode is not None:
+                if color_mode == LightColorMode.COLOR_TEMP:
+                    color_temp = results.get("color_temperature")
+                    if color_temp is not None and color_mode:
+                        self._color_temp = color_temp
+                        self._hs_color = None
+                else:
+                    color_x = results.get("current_x")
+                    color_y = results.get("current_y")
+                    if color_x is not None and color_y is not None:
+                        self._hs_color = color_util.color_xy_to_hs(
+                            float(color_x / 65535), float(color_y / 65535)
+                        )
+                        self._color_temp = None
 
-            color_x = results.get("color_x")
-            color_y = results.get("color_y")
-            if color_x is not None and color_y is not None:
-                self._hs_color = color_util.color_xy_to_hs(
-                    float(color_x / 65535), float(color_y / 65535)
-                )
-            if (
-                "color_loop_active" in results
-                and results["color_loop_active"] is not None
-            ):
-                color_loop_active = results["color_loop_active"]
+            color_loop_active = results.get("color_loop_active")
+            if color_loop_active is not None:
                 if color_loop_active == 1:
                     self._effect = light.EFFECT_COLORLOOP
+                else:
+                    self._effect = None
+
+    async def async_update(self):
+        """Update to the latest state."""
+        await self.async_get_state()
 
     async def _refresh(self, time):
         """Call async_get_state at an interval."""
-        await self.async_get_state(from_cache=False)
+        await self.async_get_state()
         self.async_write_ha_state()
+
+    async def _maybe_force_refresh(self, signal):
+        """Force update the state if the signal contains the entity id for this entity."""
+        if self.entity_id in signal["entity_ids"]:
+            await self.async_get_state()
+            self.async_write_ha_state()
 
 
 @STRICT_MATCH(
@@ -410,3 +510,98 @@ class HueLight(Light):
     """Representation of a HUE light which does not report attributes."""
 
     _REFRESH_INTERVAL = (3, 5)
+
+
+@GROUP_MATCH()
+class LightGroup(BaseLight, ZhaGroupEntity):
+    """Representation of a light group."""
+
+    def __init__(
+        self, entity_ids: List[str], unique_id: str, group_id: int, zha_device, **kwargs
+    ) -> None:
+        """Initialize a light group."""
+        super().__init__(entity_ids, unique_id, group_id, zha_device, **kwargs)
+        group = self.zha_device.gateway.get_group(self._group_id)
+        self._on_off_channel = group.endpoint[OnOff.cluster_id]
+        self._level_channel = group.endpoint[LevelControl.cluster_id]
+        self._color_channel = group.endpoint[Color.cluster_id]
+        self._identify_channel = group.endpoint[Identify.cluster_id]
+        self._debounced_member_refresh = None
+
+    async def async_added_to_hass(self):
+        """Run when about to be added to hass."""
+        await super().async_added_to_hass()
+        if self._debounced_member_refresh is None:
+            force_refresh_debouncer = Debouncer(
+                self.hass,
+                _LOGGER,
+                cooldown=3,
+                immediate=True,
+                function=self._force_member_updates,
+            )
+            self._debounced_member_refresh = force_refresh_debouncer
+
+    async def async_turn_on(self, **kwargs):
+        """Turn the entity on."""
+        await super().async_turn_on(**kwargs)
+        await self._debounced_member_refresh.async_call()
+
+    async def async_turn_off(self, **kwargs):
+        """Turn the entity off."""
+        await super().async_turn_off(**kwargs)
+        await self._debounced_member_refresh.async_call()
+
+    async def async_update(self) -> None:
+        """Query all members and determine the light group state."""
+        all_states = [self.hass.states.get(x) for x in self._entity_ids]
+        states: List[State] = list(filter(None, all_states))
+        on_states = [state for state in states if state.state == STATE_ON]
+
+        self._state = len(on_states) > 0
+        self._available = any(state.state != STATE_UNAVAILABLE for state in states)
+
+        self._brightness = helpers.reduce_attribute(on_states, ATTR_BRIGHTNESS)
+
+        self._hs_color = helpers.reduce_attribute(
+            on_states, ATTR_HS_COLOR, reduce=helpers.mean_tuple
+        )
+
+        self._white_value = helpers.reduce_attribute(on_states, ATTR_WHITE_VALUE)
+
+        self._color_temp = helpers.reduce_attribute(on_states, ATTR_COLOR_TEMP)
+        self._min_mireds = helpers.reduce_attribute(
+            states, ATTR_MIN_MIREDS, default=153, reduce=min
+        )
+        self._max_mireds = helpers.reduce_attribute(
+            states, ATTR_MAX_MIREDS, default=500, reduce=max
+        )
+
+        self._effect_list = None
+        all_effect_lists = list(helpers.find_state_attributes(states, ATTR_EFFECT_LIST))
+        if all_effect_lists:
+            # Merge all effects from all effect_lists with a union merge.
+            self._effect_list = list(set().union(*all_effect_lists))
+
+        self._effect = None
+        all_effects = list(helpers.find_state_attributes(on_states, ATTR_EFFECT))
+        if all_effects:
+            # Report the most common effect.
+            effects_count = Counter(itertools.chain(all_effects))
+            self._effect = effects_count.most_common(1)[0][0]
+
+        self._supported_features = 0
+        for support in helpers.find_state_attributes(states, ATTR_SUPPORTED_FEATURES):
+            # Merge supported features by emulating support for every feature
+            # we find.
+            self._supported_features |= support
+        # Bitwise-and the supported features with the GroupedLight's features
+        # so that we don't break in the future when a new feature is added.
+        self._supported_features &= SUPPORT_GROUP_LIGHT
+
+    async def _force_member_updates(self):
+        """Force the update of member entities to ensure the states are correct for bulbs that don't report their state."""
+        async_dispatcher_send(
+            self.hass,
+            SIGNAL_LIGHT_GROUP_STATE_CHANGED,
+            {"entity_ids": self._entity_ids},
+        )

@@ -1,4 +1,6 @@
 """Support for the definition of zones."""
+from __future__ import annotations
+
 import logging
 from typing import Any, Dict, Optional, cast
 
@@ -7,7 +9,6 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import (
     ATTR_EDITABLE,
-    ATTR_HIDDEN,
     ATTR_LATITUDE,
     ATTR_LONGITUDE,
     CONF_ICON,
@@ -26,7 +27,6 @@ from homeassistant.helpers import (
     config_validation as cv,
     entity,
     entity_component,
-    entity_registry,
     service,
     storage,
 )
@@ -77,7 +77,8 @@ def empty_value(value: Any) -> Any:
 CONFIG_SCHEMA = vol.Schema(
     {
         vol.Optional(DOMAIN, default=[]): vol.Any(
-            vol.All(cv.ensure_list, [vol.Schema(CREATE_FIELDS)]), empty_value,
+            vol.All(cv.ensure_list, [vol.Schema(CREATE_FIELDS)]),
+            empty_value,
         )
     },
     extra=vol.ALLOW_EXTRA,
@@ -183,17 +184,17 @@ async def async_setup(hass: HomeAssistant, config: Dict) -> bool:
     yaml_collection = collection.IDLessCollection(
         logging.getLogger(f"{__name__}.yaml_collection"), id_manager
     )
-    collection.attach_entity_component_collection(
-        component, yaml_collection, lambda conf: Zone(conf, False)
+    collection.sync_entity_lifecycle(
+        hass, DOMAIN, DOMAIN, component, yaml_collection, Zone.from_yaml
     )
 
     storage_collection = ZoneStorageCollection(
         storage.Store(hass, STORAGE_VERSION, STORAGE_KEY),
-        logging.getLogger(f"{__name__}_storage_collection"),
+        logging.getLogger(f"{__name__}.storage_collection"),
         id_manager,
     )
-    collection.attach_entity_component_collection(
-        component, storage_collection, lambda conf: Zone(conf, True)
+    collection.sync_entity_lifecycle(
+        hass, DOMAIN, DOMAIN, component, storage_collection, Zone
     )
 
     if config[DOMAIN]:
@@ -204,18 +205,6 @@ async def async_setup(hass: HomeAssistant, config: Dict) -> bool:
     collection.StorageCollectionWebsocket(
         storage_collection, DOMAIN, DOMAIN, CREATE_FIELDS, UPDATE_FIELDS
     ).async_setup(hass)
-
-    async def _collection_changed(change_type: str, item_id: str, config: Dict) -> None:
-        """Handle a collection change: clean up entity registry on removals."""
-        if change_type != collection.CHANGE_REMOVED:
-            return
-
-        ent_reg = await entity_registry.async_get_registry(hass)
-        ent_reg.async_remove(
-            cast(str, ent_reg.async_get_entity_id(DOMAIN, DOMAIN, item_id))
-        )
-
-    storage_collection.async_add_listener(_collection_changed)
 
     async def reload_service_handler(service_call: ServiceCall) -> None:
         """Remove all zones and load new ones from config."""
@@ -235,7 +224,7 @@ async def async_setup(hass: HomeAssistant, config: Dict) -> bool:
     if component.get_entity("zone.home"):
         return True
 
-    home_zone = Zone(_home_conf(hass), True,)
+    home_zone = Zone(_home_conf(hass))
     home_zone.entity_id = ENTITY_ID_HOME
     await component.async_add_entities([home_zone])
 
@@ -290,12 +279,20 @@ async def async_unload_entry(
 class Zone(entity.Entity):
     """Representation of a Zone."""
 
-    def __init__(self, config: Dict, editable: bool):
+    def __init__(self, config: Dict):
         """Initialize the zone."""
         self._config = config
-        self._editable = editable
+        self.editable = True
         self._attrs: Optional[Dict] = None
         self._generate_attrs()
+
+    @classmethod
+    def from_yaml(cls, config: Dict) -> Zone:
+        """Return entity instance initialized from yaml storage."""
+        zone = cls(config)
+        zone.editable = False
+        zone._generate_attrs()  # pylint:disable=protected-access
+        return zone
 
     @property
     def state(self) -> str:
@@ -322,8 +319,15 @@ class Zone(entity.Entity):
         """Return the state attributes of the zone."""
         return self._attrs
 
+    @property
+    def should_poll(self) -> bool:
+        """Zone does not poll."""
+        return False
+
     async def async_update_config(self, config: Dict) -> None:
         """Handle when the config is updated."""
+        if self._config == config:
+            return
         self._config = config
         self._generate_attrs()
         self.async_write_ha_state()
@@ -332,10 +336,9 @@ class Zone(entity.Entity):
     def _generate_attrs(self) -> None:
         """Generate new attrs based on config."""
         self._attrs = {
-            ATTR_HIDDEN: True,
             ATTR_LATITUDE: self._config[CONF_LATITUDE],
             ATTR_LONGITUDE: self._config[CONF_LONGITUDE],
             ATTR_RADIUS: self._config[CONF_RADIUS],
             ATTR_PASSIVE: self._config[CONF_PASSIVE],
-            ATTR_EDITABLE: self._editable,
+            ATTR_EDITABLE: self.editable,
         }

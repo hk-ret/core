@@ -1,5 +1,4 @@
 """The tests for the litejet component."""
-import logging
 import unittest
 from unittest import mock
 
@@ -8,8 +7,6 @@ from homeassistant.components import litejet
 
 from tests.common import get_test_home_assistant
 from tests.components.scene import common
-
-_LOGGER = logging.getLogger(__name__)
 
 ENTITY_SCENE = "scene.mock_scene_1"
 ENTITY_SCENE_NUMBER = 1
@@ -27,7 +24,7 @@ class TestLiteJetScene(unittest.TestCase):
         self.hass.start()
 
         def get_scene_name(number):
-            return "Mock Scene #" + str(number)
+            return f"Mock Scene #{number}"
 
         self.mock_lj = mock_pylitejet.return_value
         self.mock_lj.loads.return_value = range(0)

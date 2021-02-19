@@ -9,6 +9,7 @@ from homeassistant import config_entries, core, exceptions
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 
 from .const import DOMAIN  # pylint:disable=unused-import
+from .util import is_invalid_auth_code
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -20,6 +21,8 @@ async def validate_input(hass: core.HomeAssistant, data):
 
     Data has the keys from DATA_SCHEMA with values provided by the user.
     """
+
+    state_file = hass.config.path(f"nexia_config_{data[CONF_USERNAME]}.conf")
     try:
         nexia_home = NexiaHome(
             username=data[CONF_USERNAME],
@@ -27,16 +30,17 @@ async def validate_input(hass: core.HomeAssistant, data):
             auto_login=False,
             auto_update=False,
             device_name=hass.config.location_name,
+            state_file=state_file,
         )
         await hass.async_add_executor_job(nexia_home.login)
     except ConnectTimeout as ex:
         _LOGGER.error("Unable to connect to Nexia service: %s", ex)
-        raise CannotConnect
+        raise CannotConnect from ex
     except HTTPError as http_ex:
         _LOGGER.error("HTTP error from Nexia service: %s", http_ex)
-        if http_ex.response.status_code >= 400 and http_ex.response.status_code < 500:
-            raise InvalidAuth
-        raise CannotConnect
+        if is_invalid_auth_code(http_ex.response.status_code):
+            raise InvalidAuth from http_ex
+        raise CannotConnect from http_ex
 
     if not nexia_home.get_name():
         raise InvalidAuth
@@ -74,10 +78,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="user", data_schema=DATA_SCHEMA, errors=errors
         )
-
-    async def async_step_import(self, user_input):
-        """Handle import."""
-        return await self.async_step_user(user_input)
 
 
 class CannotConnect(exceptions.HomeAssistantError):

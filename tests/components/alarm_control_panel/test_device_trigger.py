@@ -22,6 +22,7 @@ from tests.common import (
     mock_device_registry,
     mock_registry,
 )
+from tests.components.blueprint.conftest import stub_blueprint_populate  # noqa
 
 
 @pytest.fixture
@@ -66,6 +67,13 @@ async def test_get_triggers(hass, device_reg, entity_reg):
             "platform": "device",
             "domain": DOMAIN,
             "type": "triggered",
+            "device_id": device_entry.id,
+            "entity_id": f"{DOMAIN}.test_5678",
+        },
+        {
+            "platform": "device",
+            "domain": DOMAIN,
+            "type": "arming",
             "device_id": device_entry.id,
             "entity_id": f"{DOMAIN}.test_5678",
         },
@@ -222,31 +230,28 @@ async def test_if_fires_on_state_change(hass, calls):
     )
 
     # Fake that the entity is armed home.
-    hass.states.async_set("alarm_control_panel.entity", STATE_ALARM_PENDING)
     hass.states.async_set("alarm_control_panel.entity", STATE_ALARM_ARMED_HOME)
     await hass.async_block_till_done()
     assert len(calls) == 3
     assert (
         calls[2].data["some"]
-        == "armed_home - device - alarm_control_panel.entity - pending - armed_home - None"
+        == "armed_home - device - alarm_control_panel.entity - disarmed - armed_home - None"
     )
 
     # Fake that the entity is armed away.
-    hass.states.async_set("alarm_control_panel.entity", STATE_ALARM_PENDING)
     hass.states.async_set("alarm_control_panel.entity", STATE_ALARM_ARMED_AWAY)
     await hass.async_block_till_done()
     assert len(calls) == 4
     assert (
         calls[3].data["some"]
-        == "armed_away - device - alarm_control_panel.entity - pending - armed_away - None"
+        == "armed_away - device - alarm_control_panel.entity - armed_home - armed_away - None"
     )
 
     # Fake that the entity is armed night.
-    hass.states.async_set("alarm_control_panel.entity", STATE_ALARM_PENDING)
     hass.states.async_set("alarm_control_panel.entity", STATE_ALARM_ARMED_NIGHT)
     await hass.async_block_till_done()
     assert len(calls) == 5
     assert (
         calls[4].data["some"]
-        == "armed_night - device - alarm_control_panel.entity - pending - armed_night - None"
+        == "armed_night - device - alarm_control_panel.entity - armed_away - armed_night - None"
     )
